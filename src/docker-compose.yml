@@ -1,0 +1,9 @@
+services:
+  traefik-hosts-to-unifi:
+    image: "ghcr.io/itsalljustdata/traefik-hosts-to-unifi:dev"
+    pull_policy: never
+    build:
+      context: .
+      args:
+        PUID: "${PUID:-1000}"
+        PGID: "${PGID:-1000}"

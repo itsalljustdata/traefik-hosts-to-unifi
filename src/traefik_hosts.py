@@ -1,0 +1,1030 @@
+#!/usr/bin/env python3
+"""
+Script to retrieve all HTTP routers with Host() rules from Traefik API
+"""
+
+import json
+import argparse
+import logging
+import os
+import re
+from typing import Dict, List
+import socket
+import ssl
+from pathlib import Path
+
+
+class MalleableLogger(logging.Logger):
+
+    def __init__(self, name):
+        super().__init__(name)
+
+    def _log_with_force(self, level, msg, force: bool = False, *args, **kwargs):
+        """Log a message with the given level, bypassing handler level filters."""
+        if force:
+            logger_level = self.getEffectiveLevel()
+            handler_levels = [(h, h.level) for h in self.handlers]
+            try:
+                self.setLevel(level)
+                for h in self.handlers:
+                    h.setLevel(level)
+                self.log(level, msg=msg, *args, **kwargs)
+            finally:
+                for h, h_level in handler_levels:
+                    h.setLevel(h_level)
+                self.setLevel(logger_level)
+        else:
+            self.log(level, msg, *args, **kwargs)
+
+def _install_level_methods() -> None:
+    def _make_method(level_value: int):
+        def _level_method(self, msg, *args, force: bool = False, **kwargs):
+            self._log_with_force(level_value, msg, force=force, *args, **kwargs)
+
+        return _level_method
+
+    for name, val  in logging._nameToLevel.items():
+        if not isinstance(val, int) or val == 0:
+            continue
+        setattr(MalleableLogger, name.lower(), _make_method(val))
+
+
+_install_level_methods()
+
+
+
+LOGGER = MalleableLogger("traefik-hosts-to-unifi")
+
+
+def configure_logging(level_name: str) -> None:
+    level = getattr(logging, level_name.upper(), logging.ERROR)
+    LOGGER.setLevel(level)
+    LOGGER.handlers.clear()
+    LOGGER.propagate = False
+
+    handler = logging.StreamHandler()
+    handler.setLevel(level)
+    handler.setFormatter(logging.Formatter("%(levelname)s: %(message)s"))
+    LOGGER.addHandler(handler)
+
+
+_TLDEXTRACT_IMPORT_ERROR = False
+try:
+    # Use bundled snapshot only; do not fetch suffix list at runtime.
+    import tldextract
+    _TLDEXTRACTOR = tldextract.TLDExtract(suffix_list_urls=())
+except ImportError:
+    _TLDEXTRACT_IMPORT_ERROR = True
+    _TLDEXTRACTOR = None
+
+UNIFI_API_KEY = None
+
+UNIFI_HOST = None
+TRAEFIK_IP = None
+TRAEFIK_DNS = None
+
+# Traefik API endpoint via the traefik-api-proxy container
+TRAEFIK_HOST = None
+TRAEFIK_PORT = 8080
+TRAEFIK_PATH = "/api/http/routers"
+UNIFI_KEEP_FILE = None
+
+DATA_DIR = "/data"
+
+def apply_runtime_args(args: argparse.Namespace) -> None:
+    global UNIFI_API_KEY
+    global UNIFI_HOST
+    global TRAEFIK_IP
+    global TRAEFIK_DNS
+    global TRAEFIK_HOST
+    global TRAEFIK_PORT
+    global TRAEFIK_PATH
+    global UNIFI_KEEP_FILE
+
+    UNIFI_API_KEY = args.unifi_api_key
+    UNIFI_HOST = args.unifi_host
+    TRAEFIK_IP = args.traefik_ip
+    TRAEFIK_DNS = args.traefik_dns
+    TRAEFIK_HOST = args.traefik_host or args.traefik_ip
+    TRAEFIK_PORT = args.traefik_port
+    TRAEFIK_PATH = args.traefik_path
+    UNIFI_KEEP_FILE = args.unifi_keep_file
+    
+
+
+def get_traefik_routers() -> List[Dict]:
+    """Fetch all HTTP routers from Traefik API"""
+    try:
+        # Use raw socket with HTTP/1.0
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.settimeout(10)
+        sock.connect((TRAEFIK_HOST, TRAEFIK_PORT))
+
+        # Send HTTP/1.0 request
+        request = f'GET {TRAEFIK_PATH} HTTP/1.0\r\nHost: {TRAEFIK_HOST}\r\nConnection: close\r\n\r\n'
+        sock.sendall(request.encode())
+
+        # Read response
+        response_data = b''
+        while True:
+            chunk = sock.recv(8192)
+            if not chunk:
+                break
+            response_data += chunk
+        sock.close()
+
+        # Parse HTTP response
+        response_text = response_data.decode('utf-8')
+        # Split headers and body
+        header_end = response_text.find('\r\n\r\n')
+        if header_end == -1:
+            LOGGER.error("Invalid HTTP response from Traefik API")
+            raise Exception("Invalid HTTP response from Traefik API")
+
+        body = response_text[header_end + 4:]
+
+        asList = json.loads(body)
+
+        # def routerSort (row):
+        #     # ['entryPoints', 'service', 'rule', 'ruleSyntax', 'priority', 'observability', 'status', 'using', 'name', 'provider', 'priorityStr']
+        #     # print (row)
+        #     splitt = row.get('name','').split('@')[:2]
+        #     name = splitt[0]
+        #     if len(splitt) > 1:
+        #         source = splitt[1]
+        #     else:
+        #         source = ''
+        #     sortKeys = ['status','provider','service']
+        #     ky =(source, name, [row.get(s,'') for s in sortKeys if s in row.keys()])
+        #     print (ky)
+        #     return ky
+
+        # if isinstance(asList,list):
+        #     asList.sort(key = routerSort)
+
+        return asList
+
+    except Exception as e:
+        msg = f"Error connecting to Traefik API at {TRAEFIK_HOST}:{TRAEFIK_PORT}{TRAEFIK_PATH}: {e}"
+        LOGGER.error(msg)
+        raise Exception(msg)
+
+
+def extract_hosts(rule: str) -> List[str]:
+    """Extract all hostnames from a Traefik rule containing Host()"""
+    # Match Host(`hostname`) or Host("hostname")
+    pattern = r'Host\([`"]([^`"]+)[`"]\)'
+    return re.findall(pattern, rule)
+
+
+def determine_tld_from_fqdn(hostname: str) -> str:
+    """Return the registrable domain portion of a hostname.
+
+    Examples:
+      - admin.caddy.darter.au -> darter.au
+      - foo.bar.example.co.uk -> example.co.uk
+    """
+    host = (hostname or "").strip().strip(".").lower()
+    if not host:
+        return "*Unknown*"
+
+    # Prefer Public Suffix List logic when tldextract is available.
+    if _TLDEXTRACTOR is not None:
+        extracted = _TLDEXTRACTOR(host)
+        registrable = getattr(extracted, "top_domain_under_public_suffix", "")
+        if registrable:
+            return registrable
+
+    labels = [part for part in host.split(".") if part]
+    if len(labels) < 2:
+        return host
+
+    # Handle common ccTLD-style registrable domains like example.co.uk.
+    # If second-level label is co/com/ac/org and TLD looks like country code,
+    # treat last 3 labels as registrable domain.
+    common_second_level = {"ac", "co", "com", "edu", "gov", "id", "mil", "net", "nic", "org"}
+    if (
+        len(labels) >= 3
+        and labels[-2] in common_second_level
+        and len(labels[-1]) == 2
+        and labels[-1].isalpha()
+    ):
+        return ".".join(labels[-3:])
+
+    return ".".join(labels[-2:])
+
+
+def decode_chunked(body: str) -> str:
+    """Decode HTTP chunked transfer encoding"""
+    lines = body.split('\r\n')
+    result = []
+    i = 0
+
+    while i < len(lines):
+        # Read chunk size (hex)
+        if not lines[i]:
+            i += 1
+            continue
+
+        try:
+            chunk_size = int(lines[i], 16)
+        except (ValueError, IndexError):
+            break
+
+        if chunk_size == 0:
+            break
+
+        # Read chunk data
+        i += 1
+        if i < len(lines):
+            result.append(lines[i])
+
+        i += 1
+
+    return ''.join(result)
+
+
+def unifi_api_request(method: str, path: str, data: dict = None) -> dict:
+    """Make a request to the Unifi API"""
+    try:
+        if not UNIFI_API_KEY:
+            return {"error": "UNIFI_API_KEY is not set"}
+        # Create SSL context that doesn't verify certificates (self-signed)
+        context = ssl.create_default_context()
+        context.check_hostname = False
+        context.verify_mode = ssl.CERT_NONE
+
+        # Create socket and wrap with SSL
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.settimeout(10)
+        ssl_sock = context.wrap_socket(sock, server_hostname=UNIFI_HOST)
+        ssl_sock.connect((UNIFI_HOST, 443))
+
+        # Build request
+        headers = [
+            f"{method} {path} HTTP/1.1",
+            f"Host: {UNIFI_HOST}",
+            f"X-API-KEY: {UNIFI_API_KEY}",
+            "Content-Type: application/json",
+            "Connection: close"
+        ]
+
+        body = ""
+        if data:
+            body = json.dumps(data)
+            headers.append(f"Content-Length: {len(body)}")
+
+        request = "\r\n".join(headers) + "\r\n\r\n" + body
+        ssl_sock.sendall(request.encode())
+
+        # Read response
+        response_data = b''
+        while True:
+            chunk = ssl_sock.recv(8192)
+            if not chunk:
+                break
+            response_data += chunk
+        ssl_sock.close()
+
+        # Parse response
+        response_text = response_data.decode('utf-8')
+        header_end = response_text.find('\r\n\r\n')
+        if header_end == -1:
+            return {"error": "Invalid HTTP response"}
+
+        # Extract status code
+        headers_text = response_text[:header_end]
+        status_line = headers_text.split('\r\n')[0]
+        status_code = int(status_line.split()[1]) if len(status_line.split()) > 1 else 0
+
+        body_text = response_text[header_end + 4:].strip()
+
+        # Check if response is chunked
+        if 'transfer-encoding: chunked' in headers_text.lower():
+            body_text = decode_chunked(body_text)
+
+        # Empty body is OK for DELETE or 2xx responses
+        if not body_text:
+            if method == "DELETE" or (200 <= status_code < 300):
+                return {"success": True, "status_code": status_code}
+            return {"error": "Empty response body"}
+
+        try:
+            result = json.loads(body_text)
+        except json.JSONDecodeError as e:
+            return {"error": f"JSON decode error: {e}", "raw_body": body_text[:500]}
+
+        # Check if response indicates error
+        if isinstance(result, dict):
+            meta = result.get("meta", {})
+            if meta.get("rc") == "error":
+                return {"error": f"API Error: {meta.get('msg', 'Unknown')}", "raw_response": result}
+
+        return result
+    except Exception as e:
+        return {"error": str(e)}
+
+def create_dns_record(hostname: str, record_type: str, value : str) -> bool|dict:
+    """
+    Create a new DNS record in Unifi
+
+    Args:
+        hostname: The hostname to create (e.g., 'whoami.darter.au')
+        record_type: The type of DNS record (e.g., 'A', 'CNAME')
+        value: The value for the DNS record (e.g., IP address for 'A' record)
+
+    Returns:
+        True if successful, False otherwise
+    """
+    create_data = {
+        "key": hostname,
+        "value": value,
+        "record_type": record_type,
+        "enabled": True
+    }
+    result = unifi_api_request(
+        "POST",
+        "/proxy/network/v2/api/site/default/static-dns",
+        create_data
+    )
+    if "error" in result:
+        LOGGER.error("Error creating DNS record for %s: %s", hostname, result["error"])
+        raise Exception(f"Error creating DNS record for {hostname}: {result['error']}")
+    return result
+
+def create_dns_CNAME_record(hostname: str, cname: str = TRAEFIK_DNS) -> bool|dict:
+    return create_dns_record(hostname, "CNAME", cname)
+
+def create_dns_A_record(hostname: str, ip: str = TRAEFIK_IP) -> bool|dict:
+    """
+    Create a new DNS record in Unifi
+
+    Args:
+        hostname: The hostname to create (e.g., 'whoami.darter.au')
+        ip: The IP address to point to (defaults to TRAEFIK_IP)
+
+    Returns:
+        True if successful, False otherwise
+    """
+    return create_dns_record(hostname, "A", ip)
+
+
+def update_dns_record(hostname: str, record_id: str, ip: str = TRAEFIK_IP) -> bool:
+    """
+    Update an existing DNS record in Unifi
+
+    Args:
+        hostname: The hostname to update
+        record_id: The _id of the existing record
+        ip: The IP address to point to (defaults to TRAEFIK_IP)
+
+    Returns:
+        True if successful, False otherwise
+    """
+    try:
+        update_data = {
+            "key": hostname,
+            "value": ip,
+            "record_type": "A"
+        }
+        result = unifi_api_request(
+            "PUT",
+            f"/proxy/network/v2/api/site/default/static-dns/{record_id}",
+            update_data
+        )
+        if "error" in result:
+            LOGGER.error("Error updating DNS record for %s: %s", hostname, result["error"])
+            return False
+        LOGGER.info("Updated DNS record: %s -> %s", hostname, ip)
+        return True
+    except Exception as e:
+        LOGGER.error("Exception updating DNS record for %s: %s", hostname, e)
+        return False
+
+
+def delete_dns_record(record_id: str) -> bool:
+    """
+    Delete a DNS record from Unifi by ID
+
+    Args:
+        record_id: The _id of the record to delete
+
+    Returns:
+        True if successful, False otherwise
+    """
+    result = unifi_api_request(
+        "DELETE",
+        f"/proxy/network/v2/api/site/default/static-dns/{record_id}"
+    )
+    if "error" in result:
+        LOGGER.error("Error deleting DNS record %s: %s", record_id, result["error"])
+        raise Exception(f"Error deleting DNS record {record_id}: {result['error']}")
+    # print(f"Deleted DNS record: {record_id}")
+    return result.get("success", False)
+
+
+def create_or_update_dns_record(hostname: str, ip: str = TRAEFIK_IP) -> bool:
+    """
+    Create or update a DNS record in Unifi pointing hostname to the given IP
+
+    Args:
+        hostname: The hostname to create/update (e.g., 'whoami.darter.au')
+        ip: The IP address to point to (defaults to TRAEFIK_IP)
+
+    Returns:
+        True if successful, False otherwise
+    """
+    try:
+        # Get existing DNS records (policy engine v2 API)
+        result = unifi_api_request("GET", "/proxy/network/v2/api/site/default/static-dns")
+
+        if "error" in result:
+            LOGGER.error("Error fetching DNS records: %s", result["error"])
+            return False
+
+        # Result is a list of records
+        records = result if isinstance(result, list) else result.get("data", [])
+
+        # Check if record exists
+        existing_record = None
+        for record in records:
+            if record.get("key") == hostname:
+                existing_record = record
+                break
+
+        if existing_record:
+            # Update existing record
+            return update_dns_record(hostname, existing_record.get("_id"), ip)
+        else:
+            # Create new record
+            return create_dns_A_record(hostname, ip)
+
+    except Exception as e:
+        LOGGER.error("Exception in create_or_update_dns_record for %s: %s", hostname, e)
+        return False
+
+
+def get_unifi_dns_records() -> List[Dict]:
+    """
+    Fetch all DNS records from Unifi Dream Machine (new policy engine)
+
+    Returns:
+        List of DNS records
+    """
+    result = unifi_api_request("GET", "/proxy/network/v2/api/site/default/static-dns")
+
+    if "error" in result:
+        LOGGER.error("Error fetching DNS records: %s", result["error"])
+        raise Exception(f"API Error: {result['error']}")
+
+    # Result should be a list of DNS records
+    if isinstance(result, list):
+        return result
+
+    return result.get("data", [])
+
+def display_unifi_dns_records(displayID: bool = False):
+    """Fetch and display all DNS records from UDM"""
+    lines = get_unifi_dns_records_md(displayID)
+    for line in lines:
+        print(line)
+
+def get_unifi_dns_records_md(displayID: bool = False) -> list[str]:
+    """Fetch and display all DNS records from UDM"""
+    records = get_unifi_dns_records()
+
+    theDisplayLines = []
+    theDisplayLines.append("")
+    theDisplayLines.append(f"## UDM DNS Records ({len(records)})")
+    theDisplayLines.append("")
+
+    if not records:
+        line = "No DNS records found or unable to connect to UDM API"
+        theDisplayLines.append(line)
+        LOGGER.warning(line)
+        return theDisplayLines
+
+    def recSort (record):
+        v1 = 1 if record.get("record_type", "") in ('A','AAAA') else 2
+        host = record.get("key", "")
+        hostParts = host.split(".") if host else []
+        v2 = '.'.join(hostParts[-2:]) if len(hostParts) > 2 else hostParts[-1] if hostParts else host
+        order= ["key", "record_type", "value"]
+        return (v1, v2, [record.get(k,'') for k in order])
+
+    records.sort(key=recSort)
+
+    colHeads = {
+        "key": "Hostname",
+        "record_type": "Record Type",
+        "value": "Value",
+        "enabled": "Enabled",
+        '_id' : "ID",
+    }
+    if not displayID:
+        _ = colHeads.pop('_id','')
+
+    colWidths = {k: len(v) for k,v in colHeads.items()}
+
+    for record in records:
+        for k,v in colWidths.items():
+            thisLen = len(str(record.get(k, '')))
+            if thisLen > v:
+                colWidths[k] = thisLen + 2
+
+    line = "| "
+    for k, width in colWidths.items():
+        line += f"{colHeads[k].rjust(width)} | "
+    theDisplayLines.append(line.strip())
+
+    line = "| "
+    for v in colWidths.values():
+        line += f"{'-' * v} | "
+    theDisplayLines.append(line.strip())
+
+    for record in records:
+
+        line = "| "
+        for k, width in colWidths.items():
+            value = record.get(k, '')
+            line += f"{str(value).rjust(width)} | "
+        theDisplayLines.append(line.strip())
+
+    return theDisplayLines
+
+
+def extract_hosts(rule: str) -> List[str]:
+    """Extract all hostnames from a Traefik rule containing Host()"""
+    # Match Host(`hostname`) or Host("hostname")
+    pattern = r'Host\([`"]([^`"]+)[`"]\)'
+    return re.findall(pattern, rule)
+
+def display_traefik_host_entries():
+    lines = get_traefik_host_entries_md()
+    for line in lines:
+        print(line)
+
+def get_traefik_host_entries_md() -> list[str]:
+
+    routers = get_traefik_routers()
+
+    # Filter routers with Host() rules
+    host_routers = []
+    for router in routers:
+        rule = router.get('rule', '')
+        if 'Host(' in rule:
+            hosts = extract_hosts(rule)
+            routerName = router.get('name', 'unknown')
+            if "@" in routerName:
+                routerName,routerSource = routerName.split("@")[:2]
+            else:
+                routerSource = 'unknown'
+            host_routers.append({
+                'name': routerName,
+                'source': routerSource,
+                'rule': rule,
+                'hosts': hosts,
+                'entryPoints': router.get('entryPoints', []),
+                'service': router.get('service', 'unknown'),
+                'status': router.get('status', 'unknown'),
+                'provider': router.get('provider', 'unknown')
+            })
+
+    # # Sort by first hostname
+    # host_routers.sort(key=lambda x: x['hosts'][0] if x['hosts'] else x['name'])
+
+    colHeads = {
+        "tld": "TLD",
+        "hosts": "Hostname",
+        "name": "Router Name",
+        "source": "Source",
+        "entryPoints": "EntryPoints",
+        "status": "Status",
+    }
+
+    colWidths = {k: len(v) for k,v in colHeads.items()}
+
+    routerDisp = []
+    for router in host_routers:
+        disp = {}
+        routerList = []
+        for k in colHeads.keys():
+
+            if k == 'tld':
+                disp[k] = ''
+                continue
+            value = router.get(k, '')
+            thisLen = None
+            if k == 'hosts' and isinstance(value, list):
+                routerList = [] if value is None else value
+                if len(value) == 0:
+                    thisLen = 0
+                    value = ''
+                else:
+                    value = value[0] if value else ''
+                    if routerList:
+                        thisLen = max([len(str(v)) for v in routerList])
+                    else:
+                        thisLen = len(value)
+            else:
+                if isinstance(value, list):
+                    value = ', '.join(value)
+            disp[k] = value
+            if thisLen is None:
+                thisLen = len(str(value))
+            if thisLen > colWidths[k]:
+                colWidths[k] = thisLen + 2
+        routerDisp.append(disp)
+        if routerList and len(routerList) > 1:
+            for extraHost in routerList[1:]:
+                extraDisp = disp.copy()
+                extraDisp['hosts'] = extraHost
+                routerDisp.append(extraDisp)
+    for ix,r in enumerate(routerDisp):
+        host = r.get('hosts','')
+        splitH = host.split('.')
+        thisTLD = hosts if len(splitH) < 2 else '.'.join(splitH[1:])
+        if not thisTLD:
+            thisTLD = '*Unknown*'
+        r['tld'] = thisTLD
+        if len(thisTLD) > colWidths['tld']:
+            colWidths['tld'] = len(thisTLD)
+        routerDisp[ix] = r
+
+    def recSort (record):
+        # v1 = 1 if record.get("record_type", "") in ('A','AAAA') else 2
+        order= record.keys()
+        # host = record.get("hosts", "")
+        # hostParts = host.split(".") if host else []
+        v1 = '' #host if len(hostParts) < 2 else '.'.join(hostParts[1:])
+        ret = set([record.get(k,'') for k in order])
+        return ret
+
+    routerDisp.sort(key=recSort)
+
+    theDisplayLines = []
+    theDisplayLines.append("")
+    theDisplayLines.append(f"## Traefik Host Entries ({len(routerDisp)})")
+    theDisplayLines.append("")
+
+    if not routers:
+        line = "No routers found or unable to connect to Traefik API"
+        LOGGER.warning(line)
+        theDisplayLines.append(line)
+
+        return theDisplayLines
+
+    # Filter routers with Host() rules
+    host_routers = []
+    for router in routers:
+        rule = router.get('rule', '')
+        if 'Host(' in rule:
+            hosts = extract_hosts(rule)
+            routerName = router.get('name', 'unknown')
+            if "@" in routerName:
+                routerName,routerSource = routerName.split("@")[:2]
+            else:
+                routerSource = 'unknown'
+            host_routers.append({
+                'name': routerName,
+                'source': routerSource,
+                'rule': rule,
+                'hosts': hosts,
+                'entryPoints': router.get('entryPoints', []),
+                'service': router.get('service', 'unknown'),
+                'status': router.get('status', 'unknown'),
+                'provider': router.get('provider', 'unknown')
+            })
+
+    colHeads = {
+        "tld": "TLD",
+        "hosts": "Hostname",
+        "name": "Router Name",
+        "source": "Source",
+        "entryPoints": "EntryPoints",
+        "status": "Status",
+    }
+
+    colWidths = {k: len(v) for k,v in colHeads.items()}
+
+    routerDisp = []
+    for router in host_routers:
+        disp = {}
+        routerList = []
+        for k in colHeads.keys():
+
+            if k == 'tld':
+                disp[k] = ''
+                continue
+            value = router.get(k, '')
+            thisLen = None
+            if k == 'hosts' and isinstance(value, list):
+                routerList = [] if value is None else value
+                if len(value) == 0:
+                    thisLen = 0
+                    value = ''
+                else:
+                    value = value[0] if value else ''
+                    if routerList:
+                        thisLen = max([len(str(v)) for v in routerList])
+                    else:
+                        thisLen = len(value)
+            else:
+                if isinstance(value, list):
+                    value = ', '.join(value)
+            disp[k] = value
+            if thisLen is None:
+                thisLen = len(str(value))
+            if thisLen > colWidths[k]:
+                colWidths[k] = thisLen + 2
+        routerDisp.append(disp)
+        if routerList and len(routerList) > 1:
+            for extraHost in routerList[1:]:
+                extraDisp = disp.copy()
+                extraDisp['hosts'] = extraHost
+                routerDisp.append(extraDisp)
+    for ix,r in enumerate(routerDisp):
+        host = r.get('hosts','')
+        thisTLD = determine_tld_from_fqdn(host)
+        r['tld'] = thisTLD
+        if len(thisTLD) > colWidths['tld']:
+            colWidths['tld'] = len(thisTLD)
+        routerDisp[ix] = r
+
+    def recSort (record):
+        order= record.keys()
+        ret = [record.get(k,'') for k in order]
+        return ret
+
+    routerDisp.sort(key=recSort)
+
+    line = "| "
+    for k, width in colWidths.items():
+        line += f"{colHeads[k].rjust(width)} | "
+    theDisplayLines.append(line.strip())
+
+    line = "| "
+    for v in colWidths.values():
+        line += f"{'-' * v} | "
+    theDisplayLines.append(line.strip())
+
+    lastTLD = colHeads.get('tld')
+    for rowIx,record in enumerate(routerDisp,1):
+
+        line = "| "
+        for k, width in colWidths.items():
+            value = record.get(k, '')
+            if k == 'tld':
+                if value == lastTLD:
+                    value = " "
+                else:
+                    lastTLD = value
+
+            line += f"{str(value).rjust(width)} | "
+
+        theDisplayLines.append(line.strip())
+
+    return theDisplayLines
+
+
+
+def update_unifi_from_traefik():
+    """Fetch Traefik routers and ensure corresponding DNS records exist in UDM"""
+    routers = get_traefik_routers()
+
+    if not routers:
+        LOGGER.warning("No routers found or unable to connect to Traefik API")
+        return
+
+    unifi_dns = {u.get("key"): u for u in get_unifi_dns_records()}
+
+    allHosts = set()
+
+    for router in routers:
+        rule = router.get('rule', '')
+        if 'Host(' in rule:
+            hosts = extract_hosts(rule)
+            for host in hosts:
+                allHosts.add(host)
+                record = unifi_dns.get(host,{})
+                if not record:
+                    # print (f' - {host} creating in UDM DNS records')
+                    unifi_dns[host] = create_dns_CNAME_record(host)
+
+
+
+    extraOnes = []
+
+
+    preserveList = []
+    if UNIFI_KEEP_FILE:
+        try:
+            preserveListFile = Path(UNIFI_KEEP_FILE)
+        except Exception as e:
+            preserveListFile = None
+        try:
+            if preserveListFile and preserveListFile.is_file():
+                preserveListText = preserveListFile.read_text()
+                preserveList = json.loads(preserveListText)
+        except Exception as e:
+            LOGGER.error("Error reading preserve list file %s: %s", UNIFI_KEEP_FILE, e)
+
+
+    for dns in unifi_dns.values():
+        thisKey = dns.get('key','')
+        thisRecordType = dns.get('record_type','')
+        thisValue = dns.get('value','')
+        if thisKey == TRAEFIK_DNS:
+            continue
+        if (
+            thisKey not in allHosts
+            and thisKey not in preserveList
+            and
+            (
+                (thisRecordType == 'A' and thisValue == TRAEFIK_IP)
+             or (thisRecordType == 'CNAME' and thisValue == TRAEFIK_DNS)
+            )
+        ):
+            extraOnes.append(dns)
+
+    if extraOnes:
+        LOGGER.info(
+            "Removing extra DNS records from UDM which point to Traefik that are not in Traefik"
+        )
+        for extra in extraOnes:
+            LOGGER.info(
+                " - %s exists in UDM but not in Traefik, deleting from UDM",
+                extra.get("key"),
+            )
+            delete_dns_record(extra.get('_id'))
+    # print (extraOnes)
+
+def remove_all_traefik_dns_records_from_unifi():
+    """Remove all DNS records from UDM that point to Traefik"""
+
+    unifi_dns = {u.get("key"): u for u in get_unifi_dns_records()}
+
+    for dns in unifi_dns.values():
+        # print (dns)
+
+        thisKey = dns.get('key','')
+        thisRecordType = dns.get('record_type','')
+        thisValue = dns.get('value','')
+        # print (f"{thisRecordType=}, {thisKey=}, {thisValue=}")
+        if (
+            (thisRecordType == 'A' and thisValue == TRAEFIK_IP and thisKey != TRAEFIK_DNS)
+            or (thisRecordType == 'CNAME' and thisValue == TRAEFIK_DNS)
+        ):
+            # print (f" - {thisKey} is a CNAME record pointing to {thisValue}, deleting from UDM as it should not be there")
+            delete_dns_record(dns.get('_id'))
+
+
+def atomic_write(path: Path, content: str|list[str]) -> None:
+    if not path.parent.exists():
+        path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    if isinstance(content, list):
+        content = "\n".join(content)
+    tmp.write_text(content, encoding="utf-8")
+    tmp.replace(path)
+
+def get_all_the_lines(doUnifi: bool| None = None) -> list[str]:
+    lines = get_traefik_host_entries_md()
+    if doUnifi is None:
+        doUnifi = DO_UNIFI_API_CALLS
+    if doUnifi:
+        lines.extend(get_unifi_dns_records_md())
+    return lines
+
+def displayTheEntries(doUnifi: bool| None = None):
+    if doUnifi is None:
+        doUnifi = DO_UNIFI_API_CALLS
+    lines = get_all_the_lines(doUnifi)
+    for line in lines:
+        print(line)
+
+
+def extractTheEntries(doUnifi: bool| None = None):
+    if doUnifi is None:
+        doUnifi = DO_UNIFI_API_CALLS
+    lines = get_all_the_lines(doUnifi)
+    extractPath = Path(DATA_DIR).joinpath("extracted_hosts.md")
+    atomic_write(extractPath, lines)
+    # lvl = LOGGER.getEffectiveLevel()
+    LOGGER.info(f"Extracted host entries written to {extractPath}", force = True)
+
+
+def run_sync():
+
+    # display_traefik_host_entries()
+    update_unifi_from_traefik()
+    # display_unifi_dns_records()
+
+action_map = {
+    "display": displayTheEntries,
+    "markdown": extractTheEntries,
+    "sync": run_sync,
+    "remove-traefik-dns": remove_all_traefik_dns_records_from_unifi
+}
+
+action_needs_unifi = [k for k in action_map.keys() if k in ("sync", "remove-traefik-dns")]
+
+def cli_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Sync Traefik hosts to UniFi DNS")
+    action_map_keys = list(action_map.keys())
+    action_default = action_map_keys[0]
+
+    env_unifi_api_key = os.getenv("UNIFI_API_KEY")
+    env_unifi_host = os.getenv("UNIFI_HOST")
+    env_traefik_ip = os.getenv("TRAEFIK_IP")
+    env_traefik_dns = os.getenv("TRAEFIK_DNS")
+    env_traefik_host = os.getenv("TRAEFIK_HOST")
+    env_traefik_port = int(os.getenv("TRAEFIK_PORT", "8080"))
+    env_traefik_path = os.getenv("TRAEFIK_PATH", "/api/http/routers")
+
+    parser.add_argument(
+        "--action",
+        choices=action_map_keys,
+        default=action_default,
+        type=lambda s: s.lower(),
+        help=f"Action to perform (default: {action_default})",
+    )
+
+    parser.add_argument(
+        "--unifi-api-key",
+        default=env_unifi_api_key,
+        required=False,
+        help="UniFi API key (default: UNIFI_API_KEY)",
+    )
+    parser.add_argument(
+        "--unifi-host",
+        default=env_unifi_host,
+        required=False,
+        help=f"UniFi host (default: {env_unifi_host})",
+    )
+    parser.add_argument(
+        "--traefik-ip",
+        default=env_traefik_ip,
+        required=env_traefik_ip is None,
+        help=f"Traefik IP address (default: {env_traefik_ip})",
+    )
+    parser.add_argument(
+        "--traefik-dns",
+        default=env_traefik_dns,
+        required=env_traefik_dns is None,
+        help=f"Traefik DNS hostname (default: {env_traefik_dns})",
+    )
+    parser.add_argument(
+        "--traefik-host",
+        default=env_traefik_host,
+        help=f"Traefik API host (default: {env_traefik_host} or --traefik-ip)",
+    )
+    parser.add_argument(
+        "--traefik-port",
+        type=int,
+        default=env_traefik_port,
+        help=f"Traefik API port (default: {env_traefik_port} or 8080)",
+    )
+    parser.add_argument(
+        "--traefik-path",
+        default=env_traefik_path,
+        help=f"Traefik API path (default: {env_traefik_path} or /api/http/routers)",
+    )
+    parser.add_argument("--unifi-keep-file", help="JSON file with preserved hostnames")
+
+    parser.add_argument(
+        "--log-level",
+        default="ERROR",
+        choices=[v[0] for v in sorted([(k,v) for v,k in logging._levelToName.items() if v != logging.NOTSET],key = lambda kv: kv[1])],
+        type=lambda s: s.upper(),
+        help="Log verbosity level (default: ERROR).",
+    )
+
+    args = parser.parse_args()
+    global DO_UNIFI_API_CALLS
+    DO_UNIFI_API_CALLS = bool(args.unifi_api_key and args.unifi_host)
+    if not DO_UNIFI_API_CALLS and args.action in action_needs_unifi:
+        parser.error(f"--action {args.action} requires --unifi-api-key and --unifi-host to be set")
+
+    return args
+
+
+def main() -> int:
+    args = cli_args()
+    configure_logging(args.log_level)
+
+    apply_runtime_args(args)
+
+    if _TLDEXTRACT_IMPORT_ERROR:
+        LOGGER.warning("tldextract module not found, falling back to basic TLD extraction logic")
+
+
+    action = action_map.get(args.action)
+    if action:
+        action()
+        return 0
+    return 1
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+

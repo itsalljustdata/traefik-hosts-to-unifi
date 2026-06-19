@@ -1,0 +1,29 @@
+services:
+  traefik-hosts-to-unifi:
+    image: ghcr.io/itsalljustdata/traefik-hosts-to-unifi:${VERSION:-latest}
+    pull_policy: never
+    container_name: traefik-hosts-to-unifi
+    environment:
+      UNIFI_API_KEY: ${UNIFI_API_KEY:?set UNIFI_API_KEY in .env or shell}
+      UNIFI_HOST: ${UNIFI_HOST:?set UNIFI_HOST in .env or shell}
+      TRAEFIK_IP: ${TRAEFIK_IP:?set TRAEFIK_IP in .env or shell}
+      TRAEFIK_HOST: ${TRAEFIK_HOST:-${TRAEFIK_IP}}
+      TRAEFIK_PORT: ${TRAEFIK_PORT:-8080}
+      TRAEFIK_DNS: ${TRAEFIK_DNS:?set TRAEFIK_DNS in .env or shell}
+      ACTION: ${ACTION:-display}
+      LOOP_SECONDS: ${LOOP_SECONDS:-3600}
+      PUID: ${PUID:-1000}
+      PGID: ${PGID:-1000}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      # USER_SHELL: ${USER_SHELL:-bash}
+      UNIFI_KEEP_FILE: ${UNIFI_KEEP_FILE:-/data/unifi_keep.json}
+    volumes:
+      - type: bind
+        bind:
+          create_host_path: False
+          propagation: rprivate
+        source: ./data
+        target: /data
+        read_only: False
+    restart: on-failure:3
+    network_mode: bridge
