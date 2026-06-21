@@ -5,7 +5,7 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 
 RUN set -eux; \
-    mkdir -p /toolroot; \
+    mkdir -p /toolroot /toolroot/lib /toolroot/lib64 /toolroot/usr; \
     bins="/usr/sbin/gosu /usr/bin/curl /usr/bin/wget /usr/bin/ps /usr/bin/netstat"; \
     for b in $bins; do \
       cp --parents "$b" /toolroot; \
@@ -34,7 +34,8 @@ ENV PUID=${PUID} \
     TRAEFIK_PATH=/api/http/routers
 
 COPY --from=builder /toolroot/usr/ /usr/
-COPY --from=builder /toolroot/lib/x86_64-linux-gnu/ /lib/x86_64-linux-gnu/
+COPY --from=builder /toolroot/lib/ /lib/
+COPY --from=builder /toolroot/lib64/ /lib64/
 COPY traefik_hosts.py entrypoint.sh /app/
 
 RUN chmod +x /app/traefik_hosts.py /app/entrypoint.sh
