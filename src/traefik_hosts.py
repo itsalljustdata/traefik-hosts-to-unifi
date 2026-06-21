@@ -12,6 +12,7 @@ from typing import Dict, List
 import socket
 import ssl
 from pathlib import Path
+import tldextract
 
 
 class MalleableLogger(logging.Logger):
@@ -55,6 +56,11 @@ _install_level_methods()
 
 LOGGER = MalleableLogger("traefik-hosts-to-unifi")
 
+CONTAINER_HOSTNAME = socket.gethostname()
+
+def sanitize_filename(text: str) -> str:
+    cleaned = re.sub(r"[^A-Za-z0-9._-]", "_", text.strip())
+    return cleaned or "unknown"
 
 def configure_logging(level_name: str) -> None:
     level = getattr(logging, level_name.upper(), logging.ERROR)
@@ -68,14 +74,7 @@ def configure_logging(level_name: str) -> None:
     LOGGER.addHandler(handler)
 
 
-_TLDEXTRACT_IMPORT_ERROR = False
-try:
-    # Use bundled snapshot only; do not fetch suffix list at runtime.
-    import tldextract
-    _TLDEXTRACTOR = tldextract.TLDExtract(suffix_list_urls=())
-except ImportError:
-    _TLDEXTRACT_IMPORT_ERROR = True
-    _TLDEXTRACTOR = None
+_TLDEXTRACTOR = tldextract.TLDExtract(suffix_list_urls=())
 
 UNIFI_API_KEY = None
 
@@ -90,6 +89,12 @@ TRAEFIK_PATH = "/api/http/routers"
 UNIFI_KEEP_FILE = None
 
 DATA_DIR = "/data"
+
+def getUrlForUnifiDNS (record_id: str|None = None) -> str:
+    urlForDNS = "/proxy/network/v2/api/site/default/static-dns"
+    if record_id:
+        urlForDNS += f"/{record_id}"
+    return urlForDNS
 
 def apply_runtime_args(args: argparse.Namespace) -> None:
     global UNIFI_API_KEY
@@ -122,6 +127,12 @@ def get_traefik_routers() -> List[Dict]:
 
         # Send HTTP/1.0 request
         request = f'GET {TRAEFIK_PATH} HTTP/1.0\r\nHost: {TRAEFIK_HOST}\r\nConnection: close\r\n\r\n'
+        
+        if LOGGER.getEffectiveLevel() <= logging.DEBUG:
+            LOGGER.debug(f"{'GET'.ljust(6)} : Traefik : {TRAEFIK_HOST},{TRAEFIK_PORT}")
+            for l in request.splitlines():
+                LOGGER.debug(''.join(["  > ", l.replace('\r','')]))
+
         sock.sendall(request.encode())
 
         # Read response
@@ -144,23 +155,6 @@ def get_traefik_routers() -> List[Dict]:
         body = response_text[header_end + 4:]
 
         asList = json.loads(body)
-
-        # def routerSort (row):
-        #     # ['entryPoints', 'service', 'rule', 'ruleSyntax', 'priority', 'observability', 'status', 'using', 'name', 'provider', 'priorityStr']
-        #     # print (row)
-        #     splitt = row.get('name','').split('@')[:2]
-        #     name = splitt[0]
-        #     if len(splitt) > 1:
-        #         source = splitt[1]
-        #     else:
-        #         source = ''
-        #     sortKeys = ['status','provider','service']
-        #     ky =(source, name, [row.get(s,'') for s in sortKeys if s in row.keys()])
-        #     print (ky)
-        #     return ky
-
-        # if isinstance(asList,list):
-        #     asList.sort(key = routerSort)
 
         return asList
 
@@ -189,11 +183,10 @@ def determine_tld_from_fqdn(hostname: str) -> str:
         return "*Unknown*"
 
     # Prefer Public Suffix List logic when tldextract is available.
-    if _TLDEXTRACTOR is not None:
-        extracted = _TLDEXTRACTOR(host)
-        registrable = getattr(extracted, "top_domain_under_public_suffix", "")
-        if registrable:
-            return registrable
+    extracted = _TLDEXTRACTOR(host)
+    registrable = getattr(extracted, "top_domain_under_public_suffix", "")
+    if registrable:
+        return registrable
 
     labels = [part for part in host.split(".") if part]
     if len(labels) < 2:
@@ -248,8 +241,18 @@ def unifi_api_request(method: str, path: str, data: dict = None) -> dict:
     """Make a request to the Unifi API"""
     try:
         if not UNIFI_API_KEY:
-            return {"error": "UNIFI_API_KEY is not set"}
+            raise Exception("UNIFI_API_KEY is not set")
         # Create SSL context that doesn't verify certificates (self-signed)
+
+        if LOGGER.getEffectiveLevel() <= logging.DEBUG:
+            line = f"{method.ljust(6)} : UniFi   : {UNIFI_HOST}{path}"
+            if data:
+                line += " with data:"
+                LOGGER.debug(line)
+                LOGGER.debug(json.dumps(data, indent=2,default=str))
+            else:
+                LOGGER.debug(line)
+
         context = ssl.create_default_context()
         context.check_hostname = False
         context.verify_mode = ssl.CERT_NONE
@@ -344,7 +347,7 @@ def create_dns_record(hostname: str, record_type: str, value : str) -> bool|dict
     }
     result = unifi_api_request(
         "POST",
-        "/proxy/network/v2/api/site/default/static-dns",
+        getUrlForUnifiDNS(),
         create_data
     )
     if "error" in result:
@@ -389,7 +392,7 @@ def update_dns_record(hostname: str, record_id: str, ip: str = TRAEFIK_IP) -> bo
         }
         result = unifi_api_request(
             "PUT",
-            f"/proxy/network/v2/api/site/default/static-dns/{record_id}",
+            getUrlForUnifiDNS(record_id),
             update_data
         )
         if "error" in result:
@@ -414,7 +417,7 @@ def delete_dns_record(record_id: str) -> bool:
     """
     result = unifi_api_request(
         "DELETE",
-        f"/proxy/network/v2/api/site/default/static-dns/{record_id}"
+        getUrlForUnifiDNS(record_id)
     )
     if "error" in result:
         LOGGER.error("Error deleting DNS record %s: %s", record_id, result["error"])
@@ -436,7 +439,7 @@ def create_or_update_dns_record(hostname: str, ip: str = TRAEFIK_IP) -> bool:
     """
     try:
         # Get existing DNS records (policy engine v2 API)
-        result = unifi_api_request("GET", "/proxy/network/v2/api/site/default/static-dns")
+        result = unifi_api_request("GET", getUrlForUnifiDNS())
 
         if "error" in result:
             LOGGER.error("Error fetching DNS records: %s", result["error"])
@@ -471,7 +474,7 @@ def get_unifi_dns_records() -> List[Dict]:
     Returns:
         List of DNS records
     """
-    result = unifi_api_request("GET", "/proxy/network/v2/api/site/default/static-dns")
+    result = unifi_api_request("GET", getUrlForUnifiDNS())
 
     if "error" in result:
         LOGGER.error("Error fetching DNS records: %s", result["error"])
@@ -479,9 +482,38 @@ def get_unifi_dns_records() -> List[Dict]:
 
     # Result should be a list of DNS records
     if isinstance(result, list):
-        return result
+        ...
+    elif "data" not in result:
+        LOGGER.error("Unexpected API response format: %s", result)
+        raise Exception(f"Unexpected API response format: {result}")
+    else:
+        result = result.get("data", [])
 
-    return result.get("data", [])
+    for ix, r in enumerate(result):
+        thjs = {"tld": determine_tld_from_fqdn(r.get("key", "")), **r}
+        result[ix] = thjs
+
+    def recSort (record):
+        order= ["tld", "key", "record_type", "value"]
+        retparts = [record.get(k,'~') for k in order]
+        for ix, v in enumerate(retparts):
+            if isinstance(v, str):
+                v = v.lower()
+                if '.' in v:
+                    splitV = v.split(".")[::-1]
+                    v = '.'.join(splitV)
+                retparts[ix] = v
+        return retparts
+    
+    result.sort(key=recSort)
+
+    dumpAsJSON(
+        theData = result,
+        nameParts = [CONTAINER_HOSTNAME, "unifiDNS", UNIFI_HOST],
+        msg = "Writing UniFi DNS records"
+    )
+
+    return result
 
 def display_unifi_dns_records(displayID: bool = False):
     """Fetch and display all DNS records from UDM"""
@@ -504,17 +536,8 @@ def get_unifi_dns_records_md(displayID: bool = False) -> list[str]:
         LOGGER.warning(line)
         return theDisplayLines
 
-    def recSort (record):
-        v1 = 1 if record.get("record_type", "") in ('A','AAAA') else 2
-        host = record.get("key", "")
-        hostParts = host.split(".") if host else []
-        v2 = '.'.join(hostParts[-2:]) if len(hostParts) > 2 else hostParts[-1] if hostParts else host
-        order= ["key", "record_type", "value"]
-        return (v1, v2, [record.get(k,'') for k in order])
-
-    records.sort(key=recSort)
-
     colHeads = {
+        "tld": "TLD",
         "key": "Hostname",
         "record_type": "Record Type",
         "value": "Value",
@@ -526,11 +549,12 @@ def get_unifi_dns_records_md(displayID: bool = False) -> list[str]:
 
     colWidths = {k: len(v) for k,v in colHeads.items()}
 
-    for record in records:
+    for ix,record in enumerate(records):
         for k,v in colWidths.items():
             thisLen = len(str(record.get(k, '')))
             if thisLen > v:
                 colWidths[k] = thisLen + 2
+        records[ix] = record
 
     line = "| "
     for k, width in colWidths.items():
@@ -542,234 +566,9 @@ def get_unifi_dns_records_md(displayID: bool = False) -> list[str]:
         line += f"{'-' * v} | "
     theDisplayLines.append(line.strip())
 
-    for record in records:
-
-        line = "| "
-        for k, width in colWidths.items():
-            value = record.get(k, '')
-            line += f"{str(value).rjust(width)} | "
-        theDisplayLines.append(line.strip())
-
-    return theDisplayLines
-
-
-def extract_hosts(rule: str) -> List[str]:
-    """Extract all hostnames from a Traefik rule containing Host()"""
-    # Match Host(`hostname`) or Host("hostname")
-    pattern = r'Host\([`"]([^`"]+)[`"]\)'
-    return re.findall(pattern, rule)
-
-def display_traefik_host_entries():
-    lines = get_traefik_host_entries_md()
-    for line in lines:
-        print(line)
-
-def get_traefik_host_entries_md() -> list[str]:
-
-    routers = get_traefik_routers()
-
-    # Filter routers with Host() rules
-    host_routers = []
-    for router in routers:
-        rule = router.get('rule', '')
-        if 'Host(' in rule:
-            hosts = extract_hosts(rule)
-            routerName = router.get('name', 'unknown')
-            if "@" in routerName:
-                routerName,routerSource = routerName.split("@")[:2]
-            else:
-                routerSource = 'unknown'
-            host_routers.append({
-                'name': routerName,
-                'source': routerSource,
-                'rule': rule,
-                'hosts': hosts,
-                'entryPoints': router.get('entryPoints', []),
-                'service': router.get('service', 'unknown'),
-                'status': router.get('status', 'unknown'),
-                'provider': router.get('provider', 'unknown')
-            })
-
-    # # Sort by first hostname
-    # host_routers.sort(key=lambda x: x['hosts'][0] if x['hosts'] else x['name'])
-
-    colHeads = {
-        "tld": "TLD",
-        "hosts": "Hostname",
-        "name": "Router Name",
-        "source": "Source",
-        "entryPoints": "EntryPoints",
-        "status": "Status",
-    }
-
-    colWidths = {k: len(v) for k,v in colHeads.items()}
-
-    routerDisp = []
-    for router in host_routers:
-        disp = {}
-        routerList = []
-        for k in colHeads.keys():
-
-            if k == 'tld':
-                disp[k] = ''
-                continue
-            value = router.get(k, '')
-            thisLen = None
-            if k == 'hosts' and isinstance(value, list):
-                routerList = [] if value is None else value
-                if len(value) == 0:
-                    thisLen = 0
-                    value = ''
-                else:
-                    value = value[0] if value else ''
-                    if routerList:
-                        thisLen = max([len(str(v)) for v in routerList])
-                    else:
-                        thisLen = len(value)
-            else:
-                if isinstance(value, list):
-                    value = ', '.join(value)
-            disp[k] = value
-            if thisLen is None:
-                thisLen = len(str(value))
-            if thisLen > colWidths[k]:
-                colWidths[k] = thisLen + 2
-        routerDisp.append(disp)
-        if routerList and len(routerList) > 1:
-            for extraHost in routerList[1:]:
-                extraDisp = disp.copy()
-                extraDisp['hosts'] = extraHost
-                routerDisp.append(extraDisp)
-    for ix,r in enumerate(routerDisp):
-        host = r.get('hosts','')
-        splitH = host.split('.')
-        thisTLD = hosts if len(splitH) < 2 else '.'.join(splitH[1:])
-        if not thisTLD:
-            thisTLD = '*Unknown*'
-        r['tld'] = thisTLD
-        if len(thisTLD) > colWidths['tld']:
-            colWidths['tld'] = len(thisTLD)
-        routerDisp[ix] = r
-
-    def recSort (record):
-        # v1 = 1 if record.get("record_type", "") in ('A','AAAA') else 2
-        order= record.keys()
-        # host = record.get("hosts", "")
-        # hostParts = host.split(".") if host else []
-        v1 = '' #host if len(hostParts) < 2 else '.'.join(hostParts[1:])
-        ret = set([record.get(k,'') for k in order])
-        return ret
-
-    routerDisp.sort(key=recSort)
-
-    theDisplayLines = []
-    theDisplayLines.append("")
-    theDisplayLines.append(f"## Traefik Host Entries ({len(routerDisp)})")
-    theDisplayLines.append("")
-
-    if not routers:
-        line = "No routers found or unable to connect to Traefik API"
-        LOGGER.warning(line)
-        theDisplayLines.append(line)
-
-        return theDisplayLines
-
-    # Filter routers with Host() rules
-    host_routers = []
-    for router in routers:
-        rule = router.get('rule', '')
-        if 'Host(' in rule:
-            hosts = extract_hosts(rule)
-            routerName = router.get('name', 'unknown')
-            if "@" in routerName:
-                routerName,routerSource = routerName.split("@")[:2]
-            else:
-                routerSource = 'unknown'
-            host_routers.append({
-                'name': routerName,
-                'source': routerSource,
-                'rule': rule,
-                'hosts': hosts,
-                'entryPoints': router.get('entryPoints', []),
-                'service': router.get('service', 'unknown'),
-                'status': router.get('status', 'unknown'),
-                'provider': router.get('provider', 'unknown')
-            })
-
-    colHeads = {
-        "tld": "TLD",
-        "hosts": "Hostname",
-        "name": "Router Name",
-        "source": "Source",
-        "entryPoints": "EntryPoints",
-        "status": "Status",
-    }
-
-    colWidths = {k: len(v) for k,v in colHeads.items()}
-
-    routerDisp = []
-    for router in host_routers:
-        disp = {}
-        routerList = []
-        for k in colHeads.keys():
-
-            if k == 'tld':
-                disp[k] = ''
-                continue
-            value = router.get(k, '')
-            thisLen = None
-            if k == 'hosts' and isinstance(value, list):
-                routerList = [] if value is None else value
-                if len(value) == 0:
-                    thisLen = 0
-                    value = ''
-                else:
-                    value = value[0] if value else ''
-                    if routerList:
-                        thisLen = max([len(str(v)) for v in routerList])
-                    else:
-                        thisLen = len(value)
-            else:
-                if isinstance(value, list):
-                    value = ', '.join(value)
-            disp[k] = value
-            if thisLen is None:
-                thisLen = len(str(value))
-            if thisLen > colWidths[k]:
-                colWidths[k] = thisLen + 2
-        routerDisp.append(disp)
-        if routerList and len(routerList) > 1:
-            for extraHost in routerList[1:]:
-                extraDisp = disp.copy()
-                extraDisp['hosts'] = extraHost
-                routerDisp.append(extraDisp)
-    for ix,r in enumerate(routerDisp):
-        host = r.get('hosts','')
-        thisTLD = determine_tld_from_fqdn(host)
-        r['tld'] = thisTLD
-        if len(thisTLD) > colWidths['tld']:
-            colWidths['tld'] = len(thisTLD)
-        routerDisp[ix] = r
-
-    def recSort (record):
-        order= record.keys()
-        ret = [record.get(k,'') for k in order]
-        return ret
-
-    routerDisp.sort(key=recSort)
-
-    line = "| "
-    for k, width in colWidths.items():
-        line += f"{colHeads[k].rjust(width)} | "
-    theDisplayLines.append(line.strip())
-
-    line = "| "
-    for v in colWidths.values():
-        line += f"{'-' * v} | "
-    theDisplayLines.append(line.strip())
 
     lastTLD = colHeads.get('tld')
-    for rowIx,record in enumerate(routerDisp,1):
+    for record in records:
 
         line = "| "
         for k, width in colWidths.items():
@@ -781,7 +580,117 @@ def get_traefik_host_entries_md() -> list[str]:
                     lastTLD = value
 
             line += f"{str(value).rjust(width)} | "
+        theDisplayLines.append(line.strip())
 
+    return theDisplayLines
+
+def display_traefik_host_entries():
+    lines = get_traefik_host_entries_md()
+    for line in lines:
+        print(line)
+
+def dumpAsJSON (theData, nameParts: list[str],msg: str = "Dumping data to JSON file"):
+    if LOGGER.getEffectiveLevel() <= logging.DEBUG:
+        if not nameParts[-1].lower() == "json":
+            nameParts.append("json")
+        fname = sanitize_filename('.'.join(nameParts))
+        jsonFile = Path(DATA_DIR).joinpath(fname)
+        LOGGER.debug(f"{msg} to '{fname}'")
+        jsonData = json.dumps(theData, indent=2, default=str)
+        atomic_write(jsonFile, jsonData)
+
+def get_exploded_traefik_routers() -> List[Dict]:
+    exploded = []
+    for router in get_traefik_routers():
+        rule = router.get("rule", "")
+        if "Host(" not in rule:
+            continue
+        hosts = extract_hosts(rule)
+        router_name = router.get("name", "unknown")
+        if "@" in router_name:
+            router_name, router_source = router_name.split("@")[:2]
+        else:
+            router_source = "unknown"
+        for host in hosts:
+            row = {
+                "tld": determine_tld_from_fqdn(host),
+                "hostname": host,
+                "name": router_name,
+                "source": router_source,
+                "entryPoints": ", ".join(router.get("entryPoints", [])),
+                "status": router.get("status", "unknown"),
+            }
+            row.update({k:v for k,v in router.items() if k not in row})
+            exploded.append(row)
+
+    def recSort(record):
+        retparts = [record.get(k, "") for k in list(record.keys())[:6]]
+        for ix, val in enumerate(retparts):
+            if isinstance(val, str):
+                low = val.lower()
+                if "." in low:
+                    low = ".".join(low.split(".")[::-1])
+                retparts[ix] = low
+        return retparts
+
+    exploded.sort(key=recSort)
+
+    dumpAsJSON(
+        theData = exploded,
+        nameParts = [CONTAINER_HOSTNAME, "traefikRouters", TRAEFIK_IP],
+        msg = "Writing traefik routers"
+    )
+
+    return exploded
+
+
+def get_traefik_host_entries_md() -> list[str]:
+    routerDisp = get_exploded_traefik_routers()
+    theDisplayLines = ["", f"## Traefik Host Entries ({len(routerDisp)})", ""]
+    if not routerDisp:
+        line = "No routers found or unable to connect to Traefik API"
+        LOGGER.warning(line)
+        theDisplayLines.append(line)
+        return theDisplayLines
+
+
+    colHeads = {
+        "tld": "TLD",
+        "hostname": "Hostname",
+        "name": "Router Name",
+        "source": "Source",
+        "entryPoints": "EntryPoints",
+        "status": "Status",
+    }
+    colWidths = {k: len(v) for k, v in colHeads.items()}
+
+    for row in routerDisp:
+        for k, v in [(k,v) for k,v in row.items() if k in colWidths]:
+            colWidths[k] = max(colWidths[k], len(str(v)) + 2)
+
+
+
+    line = "| "
+    for k, width in colWidths.items():
+        line += f"{colHeads[k].rjust(width)} | "
+    theDisplayLines.append(line.strip())
+
+    line = "| "
+    for v in colWidths.values():
+        line += f"{'-' * v} | "
+    theDisplayLines.append(line.strip())
+
+    lastTLD = colHeads.get("tld")
+    for record in routerDisp:
+        line = "| "
+        for k, width in colWidths.items():
+            value = record.get(k, "")
+            if k == "tld":
+                if value == lastTLD:
+                    value = " "
+                else:
+                    lastTLD = value
+            line += f"{str(value).rjust(width)} | "
         theDisplayLines.append(line.strip())
 
     return theDisplayLines
@@ -790,7 +699,7 @@ def get_traefik_host_entries_md() -> list[str]:
 
 def update_unifi_from_traefik():
     """Fetch Traefik routers and ensure corresponding DNS records exist in UDM"""
-    routers = get_traefik_routers()
+    routers = get_exploded_traefik_routers()
 
     if not routers:
         LOGGER.warning("No routers found or unable to connect to Traefik API")
@@ -801,15 +710,12 @@ def update_unifi_from_traefik():
     allHosts = set()
 
     for router in routers:
-        rule = router.get('rule', '')
-        if 'Host(' in rule:
-            hosts = extract_hosts(rule)
-            for host in hosts:
-                allHosts.add(host)
-                record = unifi_dns.get(host,{})
-                if not record:
-                    # print (f' - {host} creating in UDM DNS records')
-                    unifi_dns[host] = create_dns_CNAME_record(host)
+        host = router.get('hostname','')
+        allHosts.add(host)
+        record = unifi_dns.get(host,{})
+        if not record:
+            # print (f' - {host} creating in UDM DNS records')
+            unifi_dns[host] = create_dns_CNAME_record(host)
 
 
 
@@ -918,6 +824,9 @@ def run_sync():
 
     # display_traefik_host_entries()
     update_unifi_from_traefik()
+    if LOGGER.getEffectiveLevel() <= logging.DEBUG:
+        LOGGER.info("Sync complete, displaying current Traefik host entries and UDM DNS records:")
+        displayTheEntries()
     # display_unifi_dns_records()
 
 action_map = {
@@ -1014,9 +923,6 @@ def main() -> int:
     configure_logging(args.log_level)
 
     apply_runtime_args(args)
-
-    if _TLDEXTRACT_IMPORT_ERROR:
-        LOGGER.warning("tldextract module not found, falling back to basic TLD extraction logic")
 
 
     action = action_map.get(args.action)

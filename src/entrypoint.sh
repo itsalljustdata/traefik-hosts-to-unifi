@@ -141,13 +141,12 @@ if [ -n "$UNIFI_KEEP_FILE" ]; then
     ARGS+=("--unifi-keep-file" "$UNIFI_KEEP_FILE")
 fi
 
-echo "${ARGS[@]}"
 run_once() {
   gosu "$run_user" /app/traefik_hosts.py "${ARGS[@]}"
 }
 
 if [ "$ACTION" = "sync" ]; then
-    if ! [[ "$LOOP_SECONDS" =~ ^[0-9]+$ ]] || [ "$LOOP_SECONDS" -le 0 ]; then
+    if ! [[ "$LOOP_SECONDS" =~ ^[0-9]+$ ]] || [ "$LOOP_SECONDS" -lt 0 ]; then
         echo "warning: ACTION=sync requires LOOP_SECONDS > 0; defaulting to 3600" >&2
         LOOP_SECONDS=3600
     fi
@@ -155,20 +154,25 @@ if [ "$ACTION" = "sync" ]; then
     consecutive_failures=0
     max_consecutive_failures=3
 
-    while true; do
-        if run_once; then
-            consecutive_failures=0
-        else
-            consecutive_failures=$((consecutive_failures + 1))
-            echo "error: sync run failed (${consecutive_failures} consecutive failures)" >&2
-            if [ "$consecutive_failures" -gt "$max_consecutive_failures" ]; then
-                echo "error: exceeded ${max_consecutive_failures} consecutive failures; exiting" >&2
-                exit 1
+    if [ "$LOOP_SECONDS" -eq 0 ]; then
+        echo "info: LOOP_SECONDS=0; running once and then exiting" 
+        run_once
+    else
+        while true; do
+            if run_once; then
+                consecutive_failures=0
+            else
+                consecutive_failures=$((consecutive_failures + 1))
+                echo "error: sync run failed (${consecutive_failures} consecutive failures)" >&2
+                if [ "$consecutive_failures" -gt "$max_consecutive_failures" ]; then
+                    echo "error: exceeded ${max_consecutive_failures} consecutive failures; exiting" >&2
+                    exit 1
+                fi
             fi
-        fi
 
-        sleep "$LOOP_SECONDS"
-    done
+            sleep "$LOOP_SECONDS"
+        done
+    fi
 else
     run_once
 fi

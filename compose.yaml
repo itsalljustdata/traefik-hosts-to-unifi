@@ -1,8 +1,8 @@
 services:
   traefik-hosts-to-unifi:
     image: ghcr.io/itsalljustdata/traefik-hosts-to-unifi:${VERSION:-latest}
-    pull_policy: never
-    container_name: traefik-hosts-to-unifi
+    container_name: ${CONTAINER_NAME:-traefik-hosts-to-unifi}
+    hostname: ${CONTAINER_HOSTNAME:-unifipush}
     environment:
       UNIFI_API_KEY: ${UNIFI_API_KEY:?set UNIFI_API_KEY in .env or shell}
       UNIFI_HOST: ${UNIFI_HOST:?set UNIFI_HOST in .env or shell}
@@ -26,4 +26,8 @@ services:
         target: /data
         read_only: False
     restart: on-failure:3
-    network_mode: bridge
+    
+networks:
+  default:
+    name: traefik-proxy
+    external: true
