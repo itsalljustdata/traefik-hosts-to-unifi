@@ -20,7 +20,7 @@ class MalleableLogger(logging.Logger):
     def __init__(self, name):
         super().__init__(name)
 
-    def _log_with_force(self, level, msg, force: bool = False, *args, **kwargs):
+    def _log_with_force(self, level, msg, *args, force: bool = False, **kwargs):
         """Log a message with the given level, bypassing handler level filters."""
         if force:
             logger_level = self.getEffectiveLevel()
@@ -40,7 +40,7 @@ class MalleableLogger(logging.Logger):
 def _install_level_methods() -> None:
     def _make_method(level_value: int):
         def _level_method(self, msg, *args, force: bool = False, **kwargs):
-            self._log_with_force(level_value, msg, force=force, *args, **kwargs)
+            self._log_with_force(level_value, msg, *args, force=force, **kwargs)
 
         return _level_method
 

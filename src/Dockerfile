@@ -1,12 +1,21 @@
 FROM python:3.12-slim AS builder
 
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends gosu \
+    && apt-get install -y --no-install-recommends gosu procps curl wget net-tools \
     && rm -rf /var/lib/apt/lists/*
+
+RUN set -eux; \
+    mkdir -p /toolroot; \
+    bins="/usr/sbin/gosu /usr/bin/curl /usr/bin/wget /usr/bin/ps /usr/bin/netstat"; \
+    for b in $bins; do \
+      cp --parents "$b" /toolroot; \
+            ldd "$b" | awk '/=> \// {print $3} /^\// {print $1}' | xargs -r -I '{}' cp --parents '{}' /toolroot; \
+    done; \
+    cp --parents /lib64/ld-linux-x86-64.so.2 /toolroot 2>/dev/null || true
 
 WORKDIR /src
 COPY requirements.txt ./
-RUN pip install --no-cache-dir --prefix=/install -r requirements.txt
+RUN pip install --no-cache-dir --prefix=/toolroot/usr/local -r requirements.txt
 
 FROM python:3.12-slim AS runtime
 
@@ -24,8 +33,8 @@ ENV PUID=${PUID} \
     TRAEFIK_PORT=8080 \
     TRAEFIK_PATH=/api/http/routers
 
-COPY --from=builder /usr/sbin/gosu /usr/sbin/gosu
-COPY --from=builder /install /usr/local
+COPY --from=builder /toolroot/usr/ /usr/
+COPY --from=builder /toolroot/lib/x86_64-linux-gnu/ /lib/x86_64-linux-gnu/
 COPY traefik_hosts.py entrypoint.sh /app/
 
 RUN chmod +x /app/traefik_hosts.py /app/entrypoint.sh
