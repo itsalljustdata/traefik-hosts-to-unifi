@@ -126,11 +126,23 @@ else
     fi
 fi
 
-chown -R "$PUID:$PGID" /app
+# Ensure /app is owned by the runtime user and is readable
+chown -R "$PUID:$PGID" /app || true
+if [ ! -r /app ]; then
+    echo "error: /app is not readable by $run_user (uid: $PUID, gid: $PGID)" >&2
+    exit 1
+fi
+
+# Ensure /data exists and is writable by the runtime user
 if [ ! -d /data ]; then
     mkdir -p /data
 fi
-chown -R "$PUID:$PGID" /data
+chown -R "$PUID:$PGID" /data 2> /dev/null || true
+if [ ! -w /data ]; then
+    echo "error: /data is not writable by $run_user (uid: $PUID, gid: $PGID)" >&2
+    exit 1
+fi
+
 
 ARGS=(
     "--action" "$ACTION"
