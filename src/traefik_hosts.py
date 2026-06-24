@@ -106,15 +106,25 @@ def apply_runtime_args(args: argparse.Namespace) -> None:
     global TRAEFIK_PATH
     global UNIFI_KEEP_FILE
 
-    UNIFI_API_KEY = args.unifi_api_key
-    UNIFI_HOST = args.unifi_host
-    TRAEFIK_IP = args.traefik_ip
-    TRAEFIK_DNS = args.traefik_dns
-    TRAEFIK_HOST = args.traefik_host or args.traefik_ip
-    TRAEFIK_PORT = args.traefik_port
-    TRAEFIK_PATH = args.traefik_path
-    UNIFI_KEEP_FILE = args.unifi_keep_file
-    
+
+    UNIFI_API_KEY = args.unifi_api_key or os.getenv("UNIFI_API_KEY")
+    UNIFI_HOST = args.unifi_host or os.getenv("UNIFI_HOST")
+    TRAEFIK_IP = args.traefik_ip or os.getenv("TRAEFIK_IP")
+    TRAEFIK_DNS = args.traefik_dns or os.getenv("TRAEFIK_DNS")
+    TRAEFIK_HOST = args.traefik_host or os.getenv("TRAEFIK_HOST") or TRAEFIK_IP
+    TRAEFIK_PORT = args.traefik_port or os.getenv("TRAEFIK_PORT") or TRAEFIK_PORT
+    TRAEFIK_PATH = args.traefik_path or os.getenv("TRAEFIK_PATH") or TRAEFIK_PATH
+    UNIFI_KEEP_FILE = args.unifi_keep_file or os.getenv("UNIFI_KEEP_FILE")
+
+    LOGGER.debug(f"Applied runtime arguments:")
+    LOGGER.debug(f"UNIFI_API_KEY  : {'*' * len(UNIFI_API_KEY) if UNIFI_API_KEY else None}")
+    LOGGER.debug(f"UNIFI_HOST     : {UNIFI_HOST}")
+    LOGGER.debug(f"TRAEFIK_IP     : {TRAEFIK_IP}")
+    LOGGER.debug(f"TRAEFIK_DNS    : {TRAEFIK_DNS}")
+    LOGGER.debug(f"TRAEFIK_HOST   : {TRAEFIK_HOST}")
+    LOGGER.debug(f"TRAEFIK_PORT   : {TRAEFIK_PORT}")
+    LOGGER.debug(f"TRAEFIK_PATH   : {TRAEFIK_PATH}")
+    LOGGER.debug(f"UNIFI_KEEP_FILE: {UNIFI_KEEP_FILE}")
 
 
 def get_traefik_routers() -> List[Dict]:
@@ -339,6 +349,7 @@ def create_dns_record(hostname: str, record_type: str, value : str) -> bool|dict
     Returns:
         True if successful, False otherwise
     """
+    LOGGER.debug(f"create_dns_record({hostname=}, {record_type=}, {value=})")
     create_data = {
         "key": hostname,
         "value": value,
@@ -350,15 +361,19 @@ def create_dns_record(hostname: str, record_type: str, value : str) -> bool|dict
         getUrlForUnifiDNS(),
         create_data
     )
-    if "error" in result:
-        LOGGER.error("Error creating DNS record for %s: %s", hostname, result["error"])
-        raise Exception(f"Error creating DNS record for {hostname}: {result['error']}")
+    LOGGER.debug(result)
+    if "errorCode" in result:
+        msgText = f"Error creating '{record_type}' DNS record for {hostname}: {result['message']}"
+        LOGGER.error(msgText)
+        raise Exception(msgText)
     return result
 
-def create_dns_CNAME_record(hostname: str, cname: str = TRAEFIK_DNS) -> bool|dict:
+def create_dns_CNAME_record(hostname: str, cname: str|None = None) -> bool|dict:
+    if cname is None:
+        cname = TRAEFIK_DNS
     return create_dns_record(hostname, "CNAME", cname)
 
-def create_dns_A_record(hostname: str, ip: str = TRAEFIK_IP) -> bool|dict:
+def create_dns_A_record(hostname: str, ip: str|None = None) -> bool|dict:
     """
     Create a new DNS record in Unifi
 
@@ -369,10 +384,12 @@ def create_dns_A_record(hostname: str, ip: str = TRAEFIK_IP) -> bool|dict:
     Returns:
         True if successful, False otherwise
     """
+    if ip is None:
+        ip = TRAEFIK_IP
     return create_dns_record(hostname, "A", ip)
 
 
-def update_dns_record(hostname: str, record_id: str, ip: str = TRAEFIK_IP) -> bool:
+def update_dns_record(hostname: str, record_id: str, ip: str|None = None) -> bool:
     """
     Update an existing DNS record in Unifi
 
@@ -384,6 +401,8 @@ def update_dns_record(hostname: str, record_id: str, ip: str = TRAEFIK_IP) -> bo
     Returns:
         True if successful, False otherwise
     """
+    if ip is None:
+        ip = TRAEFIK_IP
     try:
         update_data = {
             "key": hostname,
@@ -395,8 +414,9 @@ def update_dns_record(hostname: str, record_id: str, ip: str = TRAEFIK_IP) -> bo
             getUrlForUnifiDNS(record_id),
             update_data
         )
-        if "error" in result:
-            LOGGER.error("Error updating DNS record for %s: %s", hostname, result["error"])
+        if "errorCode" in result:
+            msgText = f"Error updating DNS record for {hostname}: {result['message']}"
+            LOGGER.error(msgText)
             return False
         LOGGER.info("Updated DNS record: %s -> %s", hostname, ip)
         return True
@@ -419,14 +439,15 @@ def delete_dns_record(record_id: str) -> bool:
         "DELETE",
         getUrlForUnifiDNS(record_id)
     )
-    if "error" in result:
-        LOGGER.error("Error deleting DNS record %s: %s", record_id, result["error"])
-        raise Exception(f"Error deleting DNS record {record_id}: {result['error']}")
+    if "errorCode" in result:
+        msgText = f"Error deleting DNS record {record_id}: {result['message']}"
+        LOGGER.error(msgText)
+        raise Exception(msgText)
     # print(f"Deleted DNS record: {record_id}")
     return result.get("success", False)
 
 
-def create_or_update_dns_record(hostname: str, ip: str = TRAEFIK_IP) -> bool:
+def create_or_update_dns_record(hostname: str, ip: str|None = None) -> bool:
     """
     Create or update a DNS record in Unifi pointing hostname to the given IP
 
@@ -437,6 +458,8 @@ def create_or_update_dns_record(hostname: str, ip: str = TRAEFIK_IP) -> bool:
     Returns:
         True if successful, False otherwise
     """
+    if ip is None:
+        ip = TRAEFIK_IP
     try:
         # Get existing DNS records (policy engine v2 API)
         result = unifi_api_request("GET", getUrlForUnifiDNS())
@@ -709,12 +732,24 @@ def update_unifi_from_traefik():
 
     allHosts = set()
 
+    LOGGER.info(f"Processing {len(routers)} Traefik routers to sync with UniFi DNS")
+
     for router in routers:
         host = router.get('hostname','')
         allHosts.add(host)
+        if host == TRAEFIK_DNS:
+            continue
         record = unifi_dns.get(host,{})
+        if record:
+            if record.get('record_type') != 'CNAME':
+                continue
+            if not (record.get('value') == TRAEFIK_DNS and record.get('enabled', False) == True):
+                LOGGER.debug(f"{host} : Existing record does not match expected CNAME to Traefik. Deleting")
+                delete_dns_record(record.get('_id'))
+                record = None
+
         if not record:
-            # print (f' - {host} creating in UDM DNS records')
+            LOGGER.info(f"{host} : creating in Unifi DNS records")
             unifi_dns[host] = create_dns_CNAME_record(host)
 
 
@@ -850,6 +885,8 @@ def cli_args() -> argparse.Namespace:
     env_traefik_host = os.getenv("TRAEFIK_HOST")
     env_traefik_port = int(os.getenv("TRAEFIK_PORT", "8080"))
     env_traefik_path = os.getenv("TRAEFIK_PATH", "/api/http/routers")
+    env_unifi_keep_file = os.getenv("UNIFI_KEEP_FILE")
+    env_log_level = os.getenv("LOG_LEVEL", "ERROR").upper()
 
     parser.add_argument(
         "--action",
@@ -899,17 +936,23 @@ def cli_args() -> argparse.Namespace:
         default=env_traefik_path,
         help=f"Traefik API path (default: {env_traefik_path} or /api/http/routers)",
     )
-    parser.add_argument("--unifi-keep-file", help="JSON file with preserved hostnames")
+    parser.add_argument(
+        "--unifi-keep-file",
+        default=env_unifi_keep_file,
+        help="JSON file with preserved hostnames"
+        )
 
     parser.add_argument(
         "--log-level",
-        default="ERROR",
+        default=env_log_level,
         choices=[v[0] for v in sorted([(k,v) for v,k in logging._levelToName.items() if v != logging.NOTSET],key = lambda kv: kv[1])],
         type=lambda s: s.upper(),
         help="Log verbosity level (default: ERROR).",
     )
 
     args = parser.parse_args()
+    configure_logging(args.log_level)
+    LOGGER.debug(args)
     global DO_UNIFI_API_CALLS
     DO_UNIFI_API_CALLS = bool(args.unifi_api_key and args.unifi_host)
     if not DO_UNIFI_API_CALLS and args.action in action_needs_unifi:
