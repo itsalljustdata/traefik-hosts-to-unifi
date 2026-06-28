@@ -1,4 +1,4 @@
-FROM python:3.12-slim AS builder
+FROM python:3-slim AS builder
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends gosu procps curl wget net-tools \
@@ -17,7 +17,7 @@ WORKDIR /src
 COPY requirements.txt ./
 RUN pip install --no-cache-dir --prefix=/toolroot/usr/local -r requirements.txt
 
-FROM python:3.12-slim AS runtime
+FROM python:3-slim AS runtime
 
 ARG PUID=1000
 ARG PGID=1000
