@@ -88,6 +88,8 @@ TRAEFIK_PORT = 8080
 TRAEFIK_PATH = "/api/http/routers"
 UNIFI_KEEP_FILE = None
 
+DELETE_EXTRA_DNS_RECORDS: bool = False
+
 DATA_DIR = "/data"
 
 def getUrlForUnifiDNS (record_id: str|None = None) -> str:
@@ -105,6 +107,7 @@ def apply_runtime_args(args: argparse.Namespace) -> None:
     global TRAEFIK_PORT
     global TRAEFIK_PATH
     global UNIFI_KEEP_FILE
+    global DELETE_EXTRA_DNS_RECORDS
 
 
     UNIFI_API_KEY = args.unifi_api_key or os.getenv("UNIFI_API_KEY")
@@ -115,16 +118,18 @@ def apply_runtime_args(args: argparse.Namespace) -> None:
     TRAEFIK_PORT = args.traefik_port or os.getenv("TRAEFIK_PORT") or TRAEFIK_PORT
     TRAEFIK_PATH = args.traefik_path or os.getenv("TRAEFIK_PATH") or TRAEFIK_PATH
     UNIFI_KEEP_FILE = args.unifi_keep_file or os.getenv("UNIFI_KEEP_FILE")
+    DELETE_EXTRA_DNS_RECORDS = args.delete_extra_dns_records or os.getenv("DELETE_EXTRA_DNS_RECORDS", "false").lower() in ("1", "true", "yes")
 
     LOGGER.debug(f"Applied runtime arguments:")
-    LOGGER.debug(f"UNIFI_API_KEY  : {'*' * len(UNIFI_API_KEY) if UNIFI_API_KEY else None}")
-    LOGGER.debug(f"UNIFI_HOST     : {UNIFI_HOST}")
-    LOGGER.debug(f"TRAEFIK_IP     : {TRAEFIK_IP}")
-    LOGGER.debug(f"TRAEFIK_DNS    : {TRAEFIK_DNS}")
-    LOGGER.debug(f"TRAEFIK_HOST   : {TRAEFIK_HOST}")
-    LOGGER.debug(f"TRAEFIK_PORT   : {TRAEFIK_PORT}")
-    LOGGER.debug(f"TRAEFIK_PATH   : {TRAEFIK_PATH}")
-    LOGGER.debug(f"UNIFI_KEEP_FILE: {UNIFI_KEEP_FILE}")
+    LOGGER.debug(f"UNIFI_API_KEY           : {'*' * len(UNIFI_API_KEY) if UNIFI_API_KEY else None}")
+    LOGGER.debug(f"UNIFI_HOST              : {UNIFI_HOST}")
+    LOGGER.debug(f"TRAEFIK_IP              : {TRAEFIK_IP}")
+    LOGGER.debug(f"TRAEFIK_DNS             : {TRAEFIK_DNS}")
+    LOGGER.debug(f"TRAEFIK_HOST            : {TRAEFIK_HOST}")
+    LOGGER.debug(f"TRAEFIK_PORT            : {TRAEFIK_PORT}")
+    LOGGER.debug(f"TRAEFIK_PATH            : {TRAEFIK_PATH}")
+    LOGGER.debug(f"UNIFI_KEEP_FILE         : {UNIFI_KEEP_FILE}")
+    LOGGER.debug(f"DELETE_EXTRA_DNS_RECORDS: {DELETE_EXTRA_DNS_RECORDS}")
 
 
 def get_traefik_routers() -> List[Dict]:
@@ -539,22 +544,22 @@ def get_unifi_dns_records() -> List[Dict]:
     return result
 
 def display_unifi_dns_records(displayID: bool = False):
-    """Fetch and display all DNS records from UDM"""
+    """Fetch and display all DNS records from Unifi"""
     lines = get_unifi_dns_records_md(displayID)
     for line in lines:
         print(line)
 
 def get_unifi_dns_records_md(displayID: bool = False) -> list[str]:
-    """Fetch and display all DNS records from UDM"""
+    """Fetch and display all DNS records from Unifi"""
     records = get_unifi_dns_records()
 
     theDisplayLines = []
     theDisplayLines.append("")
-    theDisplayLines.append(f"## UDM DNS Records ({len(records)})")
+    theDisplayLines.append(f"## Unifi DNS Records ({len(records)})")
     theDisplayLines.append("")
 
     if not records:
-        line = "No DNS records found or unable to connect to UDM API"
+        line = "No DNS records found or unable to connect to Unifi API"
         theDisplayLines.append(line)
         LOGGER.warning(line)
         return theDisplayLines
@@ -721,7 +726,7 @@ def get_traefik_host_entries_md() -> list[str]:
 
 
 def update_unifi_from_traefik():
-    """Fetch Traefik routers and ensure corresponding DNS records exist in UDM"""
+    """Fetch Traefik routers and ensure corresponding DNS records exist in Unifi"""
     routers = get_exploded_traefik_routers()
 
     if not routers:
@@ -789,19 +794,25 @@ def update_unifi_from_traefik():
             extraOnes.append(dns)
 
     if extraOnes:
-        LOGGER.info(
-            "Removing extra DNS records from UDM which point to Traefik that are not in Traefik"
-        )
-        for extra in extraOnes:
-            LOGGER.info(
-                " - %s exists in UDM but not in Traefik, deleting from UDM",
-                extra.get("key"),
+        if not DELETE_EXTRA_DNS_RECORDS:
+            LOGGER.warning(
+                "Found extra DNS records in Unifi which point to Traefik but are not in Traefik. Not deleting because DELETE_EXTRA_DNS_RECORDS is False"
             )
-            delete_dns_record(extra.get('_id'))
+            for extra in extraOnes:
+                LOGGER.warning(f" - {extra.get('key')}")
+        else:
+            LOGGER.info(
+                "Removing extra DNS records from Unifi which point to Traefik that are not in Traefik"
+            )
+            for extra in extraOnes:
+                LOGGER.info(
+                    f" - {extra.get('key')} exists in Unifi but not in Traefik, deleting from Unifi"
+                )
+                delete_dns_record(extra.get('_id'))
     # print (extraOnes)
 
 def remove_all_traefik_dns_records_from_unifi():
-    """Remove all DNS records from UDM that point to Traefik"""
+    """Remove all DNS records from Unifi that point to Traefik"""
 
     unifi_dns = {u.get("key"): u for u in get_unifi_dns_records()}
 
@@ -816,7 +827,7 @@ def remove_all_traefik_dns_records_from_unifi():
             (thisRecordType == 'A' and thisValue == TRAEFIK_IP and thisKey != TRAEFIK_DNS)
             or (thisRecordType == 'CNAME' and thisValue == TRAEFIK_DNS)
         ):
-            # print (f" - {thisKey} is a CNAME record pointing to {thisValue}, deleting from UDM as it should not be there")
+            # print (f" - {thisKey} is a CNAME record pointing to {thisValue}, deleting from Unifi as it should not be there")
             delete_dns_record(dns.get('_id'))
 
 
@@ -860,7 +871,7 @@ def run_sync():
     # display_traefik_host_entries()
     update_unifi_from_traefik()
     if LOGGER.getEffectiveLevel() <= logging.DEBUG:
-        LOGGER.info("Sync complete, displaying current Traefik host entries and UDM DNS records:")
+        LOGGER.info("Sync complete, displaying current Traefik host entries and Unifi DNS records:")
         displayTheEntries()
     # display_unifi_dns_records()
 
@@ -941,6 +952,11 @@ def cli_args() -> argparse.Namespace:
         default=env_unifi_keep_file,
         help="JSON file with preserved hostnames"
         )
+    parser.add_argument(
+        "--delete-extra-dns-records",
+        action="store_true",
+        help="Delete extra DNS records from Unifi that point to Traefik but are not in Traefik",
+    )
 
     parser.add_argument(
         "--log-level",

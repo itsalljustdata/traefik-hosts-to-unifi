@@ -17,6 +17,7 @@ services:
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
       # USER_SHELL: ${USER_SHELL:-bash}
       UNIFI_KEEP_FILE: ${UNIFI_KEEP_FILE:-/data/unifi_keep.json}
+      DELETE_EXTRA_DNS_RECORDS: ${DELETE_EXTRA_DNS_RECORDS:-false}
     volumes:
       - type: bind
         bind:
