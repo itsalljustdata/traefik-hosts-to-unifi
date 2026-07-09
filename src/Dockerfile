@@ -36,8 +36,8 @@ ENV PUID=${PUID} \
 COPY --from=builder /toolroot/usr/ /usr/
 COPY --from=builder /toolroot/lib/ /lib/
 COPY --from=builder /toolroot/lib64/ /lib64/
-COPY traefik_hosts.py entrypoint.sh /app/
+COPY traefik_hosts.py entrypoint.sh sync_now.sh /app/
 
-RUN chmod +x /app/traefik_hosts.py /app/entrypoint.sh
+RUN chmod +x /app/traefik_hosts.py /app/*.sh
 
 ENTRYPOINT ["/app/entrypoint.sh"]

@@ -4,6 +4,31 @@ set -euo pipefail
 app_user="reader"
 app_group="reader"
 
+first_arg="${1:-}"
+
+ACTION_OVERRIDE=""
+
+if [ -n "$first_arg" ]; then
+    if [[ "$first_arg" == --action=* ]]; then
+        ACTION_OVERRIDE="${first_arg#--action=}"
+        if [ -z "$ACTION_OVERRIDE" ]; then
+            echo "error: --action requires a value" >&2
+            exit 1
+        fi
+    fi
+fi
+
+LOOP_SECONDS="${LOOP_SECONDS:-3600}"
+
+if [ -n "$ACTION_OVERRIDE" ]; then
+    ACTION="$ACTION_OVERRIDE"
+    if [ "$ACTION" = "sync" ]; then
+        LOOP_SECONDS=0
+    fi
+else
+    ACTION="${ACTION:-display}"
+fi
+
 file_env() {
     local var_name="$1"
     local default_value="${2:-}"
@@ -39,8 +64,6 @@ file_env() {
 PUID="${PUID:-1000}"
 PGID="${PGID:-1000}"
 USER_SHELL="${USER_SHELL:-/usr/sbin/nologin}"
-ACTION="${ACTION:-display}"
-LOOP_SECONDS="${LOOP_SECONDS:-3600}"
 LOG_LEVEL="${LOG_LEVEL:-ERROR}"
 UNIFI_KEEP_FILE="${UNIFI_KEEP_FILE:-}"
 
