@@ -58,7 +58,7 @@ Runtime compose file:
 | TRAEFIK_PORT | 8080 | Traefik API proxy port |
 | TRAEFIK_DNS | traefik.darter.au | Canonical Traefik DNS target |
 | TRAEFIK_IP | 10.1.2.200 | Traefik IP used for A records |
-| ACTION | display | `display`, `sync`, `remove-traefik-dns` |
+| ACTION | display | `display`, `sync`, `remove-traefik-dns`, `markdown` |
 | LOOP_SECONDS | 0 | Interval loop; 0 = run once |
 | PUID | 1000 | Runtime UID for mapped user |
 | PGID | 1000 | Runtime GID for mapped user |
