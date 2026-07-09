@@ -40,4 +40,6 @@ COPY traefik_hosts.py entrypoint.sh sync_now.sh /app/
 
 RUN chmod +x /app/traefik_hosts.py /app/*.sh
 
+LABEL org.opencontainers.image.description="Syncs Traefik hosts to UniFi DNS"
+
 ENTRYPOINT ["/app/entrypoint.sh"]
