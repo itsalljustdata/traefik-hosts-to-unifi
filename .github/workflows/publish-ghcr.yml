@@ -27,6 +27,8 @@ jobs:
             suffix: armv7
           - platform: linux/arm/v6
             suffix: armv6
+          - platform: linux/riscv64
+            suffix: riscv64
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -86,6 +88,9 @@ jobs:
           IMAGE: ghcr.io/${{ github.repository }}
           TAGS: ${{ steps.meta.outputs.tags }}
           SHA: ${{ github.sha }}
+          OCI_DESCRIPTION: Syncs Traefik hosts to UniFi DNS
+          OCI_SOURCE: ${{ github.server_url }}/${{ github.repository }}
+          OCI_DOCUMENTATION: ${{ github.server_url }}/${{ github.repository }}/blob/${{ github.ref_name }}/README.md
         run: |
           set -euo pipefail
           SOURCES=(
@@ -93,9 +98,15 @@ jobs:
             "$IMAGE:build-$SHA-arm64"
             "$IMAGE:build-$SHA-armv7"
             "$IMAGE:build-$SHA-armv6"
+            "$IMAGE:build-$SHA-riscv64"
           )
 
           while IFS= read -r tag; do
             [ -n "$tag" ] || continue
-            docker buildx imagetools create -t "$tag" "${SOURCES[@]}"
+            docker buildx imagetools create \
+              --annotation "index:org.opencontainers.image.description=$OCI_DESCRIPTION" \
+              --annotation "index:org.opencontainers.image.source=$OCI_SOURCE" \
+              --annotation "index:org.opencontainers.image.documentation=$OCI_DOCUMENTATION" \
+              -t "$tag" \
+              "${SOURCES[@]}"
           done <<< "$TAGS"
