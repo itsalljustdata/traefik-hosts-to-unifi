@@ -19,7 +19,7 @@ cp .env.sample .env
 2. Set at least:
 
 ```bash
-UDM_API_KEY=replace-with-your-unifi-api-key
+UNIFI_API_KEY=replace-with-your-unifi-api-key
 ```
 
 3. Run runtime compose:
@@ -52,10 +52,10 @@ Runtime compose file:
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| UDM_API_KEY | required | UniFi API key |
+| UNIFI_API_KEY | required | UniFi API key |
 | UDM_HOST | 10.1.2.1 | UniFi controller address |
 | TRAEFIK_HOST | 10.1.2.200 | Traefik API proxy host |
-| TRAEFIK_PORT | 8888 | Traefik API proxy port |
+| TRAEFIK_PORT | 8080 | Traefik API proxy port |
 | TRAEFIK_DNS | traefik.darter.au | Canonical Traefik DNS target |
 | TRAEFIK_IP | 10.1.2.200 | Traefik IP used for A records |
 | ACTION | display | `display`, `sync`, `remove-traefik-dns` |
